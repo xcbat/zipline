@@ -16,7 +16,6 @@ from collections import namedtuple
 import datetime
 from datetime import timedelta
 from textwrap import dedent
-import warnings
 from unittest import skip
 from copy import deepcopy
 
@@ -32,7 +31,9 @@ from testfixtures import TempDirectory
 import numpy as np
 import pandas as pd
 import pytz
+from pandas.io.common import PerformanceWarning
 
+from tests.warnings_catcher import WarningsCatcher
 from zipline import TradingAlgorithm
 from zipline.api import FixedSlippage
 from zipline.assets import Equity, Future
@@ -1956,7 +1957,7 @@ def handle_data(context, data):
             pass
         """)
 
-        with warnings.catch_warnings(record=True) as w:
+        with WarningsCatcher([PerformanceWarning]) as w:
             algo = TradingAlgorithm(
                 script=algocode,
                 sim_params=sim_params,
