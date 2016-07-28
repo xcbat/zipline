@@ -15,7 +15,6 @@ from abc import ABCMeta, abstractmethod, abstractproperty
 from errno import ENOENT
 from functools import partial
 from os import remove
-from os.path import exists
 import sqlite3
 import warnings
 
@@ -211,8 +210,15 @@ class BcolzDailyBarWriter(object):
     def __init__(self, filename, calendar, start_session, end_session):
         self._filename = filename
 
-        assert calendar.is_session(start_session), "Start session is invalid!"
-        assert calendar.is_session(end_session), "End session is invalid!"
+        if start_session != end_session:
+            if not calendar.is_session(start_session):
+                raise ValueError(
+                    "Start session %s is invalid!" % start_session
+                )
+            if not calendar.is_session(end_session):
+                raise ValueError(
+                    "End session %s is invalid!" % end_session
+                )
 
         self._start_session = start_session
         self._end_session = end_session
@@ -399,6 +405,10 @@ class DailyBarReader(with_metaclass(ABCMeta)):
         pass
 
     @abstractproperty
+    def sessions(self):
+        pass
+
+    @abstractproperty
     def last_available_dt(self):
         pass
 
@@ -500,7 +510,7 @@ class BcolzDailyBarReader(DailyBarReader):
         return ctable(rootdir=maybe_table_rootdir, mode='r')
 
     @lazyval
-    def _sessions(self):
+    def sessions(self):
         if 'calendar' in self._table.attrs.attrs:
             # backwards compatibility with old formats, will remove
             return DatetimeIndex(self._table.attrs['calendar'], tz='UTC')
@@ -563,7 +573,7 @@ class BcolzDailyBarReader(DailyBarReader):
 
     @property
     def last_available_dt(self):
-        return self._sessions[-1]
+        return self.sessions[-1]
 
     def _compute_slices(self, start_idx, end_idx, assets):
         """
@@ -609,8 +619,8 @@ class BcolzDailyBarReader(DailyBarReader):
 
     def load_raw_arrays(self, columns, start_date, end_date, assets):
         # Assumes that the given dates are actually in calendar.
-        start_idx = self._sessions.get_loc(start_date)
-        end_idx = self._sessions.get_loc(end_date)
+        start_idx = self.sessions.get_loc(start_date)
+        end_idx = self.sessions.get_loc(end_date)
         first_rows, last_rows, offsets = self._compute_slices(
             start_idx,
             end_idx,
@@ -654,8 +664,8 @@ class BcolzDailyBarReader(DailyBarReader):
 
         if day >= asset.end_date:
             # go back to one day before the asset ended
-            search_day = self._sessions[
-                self._sessions.searchsorted(asset.end_date) - 1
+            search_day = self.sessions[
+                self.sessions.searchsorted(asset.end_date) - 1
             ]
         else:
             search_day = day
@@ -667,9 +677,9 @@ class BcolzDailyBarReader(DailyBarReader):
                 return None
             if volumes[ix] != 0:
                 return search_day
-            prev_day_ix = self._sessions.get_loc(search_day) - 1
+            prev_day_ix = self.sessions.get_loc(search_day) - 1
             if prev_day_ix > -1:
-                search_day = self._sessions[prev_day_ix]
+                search_day = self.sessions[prev_day_ix]
             else:
                 return None
 
@@ -690,10 +700,10 @@ class BcolzDailyBarReader(DailyBarReader):
             or after the date range of the equity.
         """
         try:
-            day_loc = self._sessions.get_loc(day)
+            day_loc = self.sessions.get_loc(day)
         except:
             raise NoDataOnDate("day={0} is outside of calendar={1}".format(
-                day, self._sessions))
+                day, self.sessions))
         offset = day_loc - self._calendar_offsets[sid]
         if offset < 0:
             raise NoDataOnDate(
@@ -771,6 +781,10 @@ class PanelDailyBarReader(DailyBarReader):
         self._calendar = calendar
 
         self.panel = panel
+
+    @property
+    def sessions(self):
+        return self._calendar
 
     @property
     def last_available_dt(self):
@@ -867,7 +881,7 @@ class SQLiteAdjustmentWriter(object):
         if isinstance(conn_or_path, sqlite3.Connection):
             self.conn = conn_or_path
         elif isinstance(conn_or_path, str):
-            if overwrite and exists(conn_or_path):
+            if overwrite:
                 try:
                     remove(conn_or_path)
                 except OSError as e:
@@ -1074,6 +1088,12 @@ class SQLiteAdjustmentWriter(object):
         # Second from the dividend payouts, calculate ratios.
         dividend_ratios = self.calc_dividend_ratios(dividends)
         self.write_frame('dividends', dividend_ratios)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
 
     def write(self,
               splits=None,

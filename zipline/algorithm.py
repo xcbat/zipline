@@ -15,7 +15,7 @@
 from copy import copy
 import operator as op
 import warnings
-
+from datetime import tzinfo
 import logbook
 import pytz
 import pandas as pd
@@ -95,7 +95,8 @@ from zipline.utils.api_support import (
     ZiplineAPI,
     disallowed_in_before_trading_start)
 
-from zipline.utils.input_validation import ensure_upper_case, error_keywords
+from zipline.utils.input_validation import ensure_upper_case, error_keywords, \
+    expect_types, optional, coerce_string
 from zipline.utils.cache import CachedObject, Expired
 from zipline.utils.calendars import get_calendar
 
@@ -118,10 +119,7 @@ from zipline.utils.preprocess import preprocess
 import zipline.protocol
 from zipline.sources.requests_csv import PandasRequestsCSV
 
-from zipline.gens.sim_engine import (
-    MinuteSimulationClock,
-    DailySimulationClock,
-)
+from zipline.gens.sim_engine import MinuteSimulationClock
 from zipline.sources.benchmark_source import BenchmarkSource
 from zipline.zipline_warnings import ZiplineDeprecationWarning
 
@@ -408,8 +406,12 @@ class TradingAlgorithm(object):
 
         self.benchmark_sid = kwargs.pop('benchmark_sid', None)
 
-        # A dictionary of capital change values keyed by timestamp
+        # A dictionary of capital changes, keyed by timestamp, indicating the
+        # target/delta of the capital changes, along with values
         self.capital_changes = kwargs.pop('capital_changes', {})
+
+        # A dictionary of the actual capital change deltas, keyed by timestamp
+        self.capital_change_deltas = {}
 
     def init_engine(self, get_loader):
         """
@@ -492,25 +494,31 @@ class TradingAlgorithm(object):
         """
         If the clock property is not set, then create one based on frequency.
         """
+        trading_o_and_c = self.trading_calendar.schedule.ix[
+            self.sim_params.sessions]
+        market_closes = trading_o_and_c['market_close'].values.astype(np.int64)
+
         if self.sim_params.data_frequency == 'minute':
-            trading_o_and_c = self.trading_calendar.schedule.ix[
-                self.sim_params.sessions]
             market_opens = trading_o_and_c['market_open'].values.astype(
-                'datetime64[ns]').astype(np.int64)
-            market_closes = trading_o_and_c['market_close'].values.astype(
-                'datetime64[ns]').astype(np.int64)
+                np.int64)
 
             minutely_emission = self.sim_params.emission_rate == "minute"
 
-            clock = MinuteSimulationClock(
+            return MinuteSimulationClock(
                 self.sim_params.sessions,
                 market_opens,
                 market_closes,
                 minutely_emission
             )
-            return clock
         else:
-            return DailySimulationClock(self.sim_params.sessions)
+            # in daily mode, we want to have one bar per session, timestamped
+            # as the last minute of the session.
+            return MinuteSimulationClock(
+                self.sim_params.sessions,
+                market_closes,
+                market_closes,
+                False
+            )
 
     def _create_benchmark_source(self):
         return BenchmarkSource(
@@ -784,6 +792,70 @@ class TradingAlgorithm(object):
         daily_stats = pd.DataFrame(daily_perfs, index=daily_dts)
 
         return daily_stats
+
+    def calculate_capital_changes(self, dt, emission_rate, is_interday):
+        """
+        If there is a capital change for a given dt, this means the the change
+        occurs before `handle_data` on the given dt. In the case of the
+        change being a target value, the change will be computed on the
+        portfolio value according to prices at the given dt
+        """
+        try:
+            capital_change = self.capital_changes[dt]
+        except KeyError:
+            return
+
+        if emission_rate == 'daily':
+            # If we are running daily emission, prices won't
+            # necessarily be synced at the end of every minute, and we
+            # need the up-to-date prices for capital change
+            # calculations. We want to sync the prices as of the
+            # last market minute, and this is okay from a data portal
+            # perspective as we have technically not "advanced" to the
+            # current dt yet.
+            self.perf_tracker.position_tracker.sync_last_sale_prices(
+                self.trading_calendar.previous_minute(
+                    dt
+                ),
+                False,
+                self.data_portal
+            )
+
+        # Calculate performance before we sync prices price for the current dt
+        self.perf_tracker.cumulative_performance.calculate_performance()
+        self.perf_tracker.todays_performance.calculate_performance()
+
+        if capital_change['type'] == 'target':
+            # Get an updated portfolio value as of this dt, but do it in a way
+            # so that the performance is not recalculated. This is done so
+            # that `process_capital_change` can find the performance values
+            # for the end of the subperiod, which is the previous dt
+            self.perf_tracker.position_tracker.sync_last_sale_prices(
+                dt,
+                self._in_before_trading_start,
+                self.data_portal
+            )
+            portfolio_value = \
+                self.perf_tracker.position_tracker.stats().net_value + \
+                self.perf_tracker.cumulative_performance.ending_cash
+
+            capital_change_amount = capital_change['value'] - portfolio_value
+
+            log.info('Processing capital change to target %s at %s. Capital '
+                     'change delta is %s' % (capital_change['value'], dt,
+                                             capital_change_amount))
+        elif capital_change['type'] == 'delta':
+            capital_change_amount = capital_change['value']
+            log.info('Processing capital change of delta %s at %s'
+                     % (capital_change_amount, dt))
+        else:
+            log.error("Capital change %s does not indicate a valid type "
+                      "('target' or 'delta')" % capital_change)
+            return
+
+        self.capital_change_deltas.update({dt: capital_change_amount})
+        self.perf_tracker.process_capital_change(capital_change_amount,
+                                                 is_interday)
 
     @api_method
     def get_environment(self, field='platform'):
@@ -1477,8 +1549,11 @@ class TradingAlgorithm(object):
         self.performance_needs_update = True
 
     @api_method
+    @preprocess(tz=coerce_string(pytz.timezone))
+    @expect_types(tz=optional(tzinfo))
     def get_datetime(self, tz=None):
-        """Returns the current simulation datetime.
+        """
+        Returns the current simulation datetime.
 
         Parameters
         ----------
@@ -1492,14 +1567,9 @@ class TradingAlgorithm(object):
         """
         dt = self.datetime
         assert dt.tzinfo == pytz.utc, "Algorithm should have a utc datetime"
-
         if tz is not None:
-            # Convert to the given timezone passed as a string or tzinfo.
-            if isinstance(tz, string_types):
-                tz = pytz.timezone(tz)
             dt = dt.astimezone(tz)
-
-        return dt  # datetime.datetime objects are immutable.
+        return dt
 
     def update_dividends(self, dividend_frame):
         """

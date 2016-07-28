@@ -319,6 +319,23 @@ def handle_data(context, data):
         algo.namespace['assert_equal'] = self.assertEqual
         algo.run(self.data_portal)
 
+    def test_datetime_bad_params(self):
+        algo_text = """
+from zipline.api import get_datetime
+from pytz import timezone
+
+def initialize(context):
+    pass
+
+def handle_data(context, data):
+    get_datetime(timezone)
+"""
+        with self.assertRaises(TypeError):
+            algo = TradingAlgorithm(script=algo_text,
+                                    sim_params=self.sim_params,
+                                    env=self.env)
+            algo.run(self.data_portal)
+
     def test_get_environment(self):
         expected_env = {
             'arena': 'backtest',
@@ -2022,14 +2039,18 @@ class TestCapitalChanges(WithLogger,
             index=pd.DatetimeIndex(days),
         )
 
-    def test_capital_changes_daily_mode(self):
+    @parameterized.expand([
+        ('target', 153000.0), ('delta', 50000.0)
+    ])
+    def test_capital_changes_daily_mode(self, change_type, value):
         sim_params = factory.create_simulation_parameters(
             start=pd.Timestamp('2006-01-03', tz='UTC'),
             end=pd.Timestamp('2006-01-09', tz='UTC')
         )
 
         capital_changes = {
-            pd.Timestamp('2006-01-06', tz='UTC'): 50000
+            pd.Timestamp('2006-01-06', tz='UTC'):
+                {'type': change_type, 'value': value}
         }
 
         algocode = """
@@ -2156,8 +2177,22 @@ def order_stuff(context, data):
                 expected_cumulative[stat]
             )
 
-    @parameterized.expand([('interday',), ('intraday',)])
-    def test_capital_changes_minute_mode_daily_emission(self, change):
+        self.assertEqual(
+            algo.capital_change_deltas,
+            {pd.Timestamp('2006-01-06', tz='UTC'): 50000.0}
+        )
+
+    @parameterized.expand([
+        ('interday_target', [('2006-01-04', 2388.0)]),
+        ('interday_delta', [('2006-01-04', 1000.0)]),
+        ('intraday_target', [('2006-01-04 17:00', 2186.0),
+                             ('2006-01-04 18:00', 2806.0)]),
+        ('intraday_delta', [('2006-01-04 17:00', 500.0),
+                            ('2006-01-04 18:00', 500.0)]),
+    ])
+    def test_capital_changes_minute_mode_daily_emission(self, change, values):
+        change_loc, change_type = change.split('_')
+
         sim_params = factory.create_simulation_parameters(
             start=pd.Timestamp('2006-01-03', tz='UTC'),
             end=pd.Timestamp('2006-01-05', tz='UTC'),
@@ -2165,13 +2200,8 @@ def order_stuff(context, data):
             capital_base=1000.0
         )
 
-        if change == 'intraday':
-            capital_changes = {
-                pd.Timestamp('2006-01-04 17:00', tz='UTC'): 500.0,
-                pd.Timestamp('2006-01-04 18:00', tz='UTC'): 500.0,
-            }
-        else:
-            capital_changes = {pd.Timestamp('2006-01-04', tz='UTC'): 1000.0}
+        capital_changes = {pd.Timestamp(val[0], tz='UTC'): {
+            'type': change_type, 'value': val[1]} for val in values}
 
         algocode = """
 from zipline.api import set_slippage, set_commission, slippage, commission, \
@@ -2213,7 +2243,7 @@ def order_stuff(context, data):
             0.0, 1000.0, 0.0
         ])
 
-        if change == 'intraday':
+        if change_loc == 'intraday':
             # Fills at 491, +500 capital change comes at 638 (17:00) and
             # 698 (18:00), ends day at 879
             day2_return = (1388.0 + 149.0 + 147.0)/1388.0 * \
@@ -2250,7 +2280,7 @@ def order_stuff(context, data):
             expected_daily['ending_cash'] - \
             expected_daily['capital_used']
 
-        if change == 'intraday':
+        if change_loc == 'intraday':
             # Capital changes come after day start
             expected_daily['starting_cash'] -= expected_capital_changes
 
@@ -2295,8 +2325,29 @@ def order_stuff(context, data):
                 expected_cumulative[stat]
             )
 
-    @parameterized.expand([('interday',), ('intraday',)])
-    def test_capital_changes_minute_mode_minute_emission(self, change):
+        if change_loc == 'interday':
+            self.assertEqual(
+                algo.capital_change_deltas,
+                {pd.Timestamp('2006-01-04', tz='UTC'): 1000.0}
+            )
+        else:
+            self.assertEqual(
+                algo.capital_change_deltas,
+                {pd.Timestamp('2006-01-04 17:00', tz='UTC'): 500.0,
+                 pd.Timestamp('2006-01-04 18:00', tz='UTC'): 500.0}
+            )
+
+    @parameterized.expand([
+        ('interday_target', [('2006-01-04', 2388.0)]),
+        ('interday_delta', [('2006-01-04', 1000.0)]),
+        ('intraday_target', [('2006-01-04 17:00', 2186.0),
+                             ('2006-01-04 18:00', 2806.0)]),
+        ('intraday_delta', [('2006-01-04 17:00', 500.0),
+                            ('2006-01-04 18:00', 500.0)]),
+    ])
+    def test_capital_changes_minute_mode_minute_emission(self, change, values):
+        change_loc, change_type = change.split('_')
+
         sim_params = factory.create_simulation_parameters(
             start=pd.Timestamp('2006-01-03', tz='UTC'),
             end=pd.Timestamp('2006-01-05', tz='UTC'),
@@ -2305,13 +2356,8 @@ def order_stuff(context, data):
             capital_base=1000.0
         )
 
-        if change == 'intraday':
-            capital_changes = {
-                pd.Timestamp('2006-01-04 17:00', tz='UTC'): 500.0,
-                pd.Timestamp('2006-01-04 18:00', tz='UTC'): 500.0,
-            }
-        else:
-            capital_changes = {pd.Timestamp('2006-01-04', tz='UTC'): 1000.0}
+        capital_changes = {pd.Timestamp(val[0], tz='UTC'): {
+            'type': change_type, 'value': val[1]} for val in values}
 
         algocode = """
 from zipline.api import set_slippage, set_commission, slippage, commission, \
@@ -2352,7 +2398,7 @@ def order_stuff(context, data):
         expected_minute = {}
 
         capital_changes_after_start = np.array([0.0] * 1170)
-        if change == 'intraday':
+        if change_loc == 'intraday':
             capital_changes_after_start[539:599] = 500.0
             capital_changes_after_start[599:780] = 1000.0
 
@@ -2372,7 +2418,7 @@ def order_stuff(context, data):
         ))
 
         # +1000 capital changes comes before the day start if interday
-        day2adj = 0.0 if change == 'intraday' else 1000.0
+        day2adj = 0.0 if change_loc == 'intraday' else 1000.0
 
         expected_minute['starting_cash'] = np.concatenate((
             [1000.0] * 390,
@@ -2411,7 +2457,7 @@ def order_stuff(context, data):
         # the pnl, starting_value and starting_cash. If the change is intraday,
         # the returns after the change have to be calculated from two
         # subperiods
-        if change == 'intraday':
+        if change_loc == 'intraday':
             # The last packet (at 1/04 16:59) before the first capital change
             prev_subperiod_return = expected_minute['returns'][538]
 
@@ -2507,6 +2553,18 @@ def order_stuff(context, data):
             np.testing.assert_array_almost_equal(
                 np.array([perf[stat] for perf in cumulative_perf]),
                 expected_cumulative[stat]
+            )
+
+        if change_loc == 'interday':
+            self.assertEqual(
+                algo.capital_change_deltas,
+                {pd.Timestamp('2006-01-04', tz='UTC'): 1000.0}
+            )
+        else:
+            self.assertEqual(
+                algo.capital_change_deltas,
+                {pd.Timestamp('2006-01-04 17:00', tz='UTC'): 500.0,
+                 pd.Timestamp('2006-01-04 18:00', tz='UTC'): 500.0}
             )
 
 
@@ -3664,12 +3722,18 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
         transactions = output['transactions']
         initial_fills = transactions.iloc[1]
         self.assertEqual(len(initial_fills), len(assets))
+
+        last_minute_of_session = \
+            self.trading_calendar.open_and_close_for_session(
+                self.test_days[1]
+            )[1]
+
         for sid, txn in zip(sids, initial_fills):
             self.assertDictContainsSubset(
                 {
                     'amount': order_size,
                     'commission': None,
-                    'dt': self.test_days[1],
+                    'dt': last_minute_of_session,
                     'price': initial_fill_prices[sid],
                     'sid': sid,
                 },
@@ -3736,15 +3800,17 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
                 context.portfolio.cash == context.portfolio.starting_cash
             )
 
-            now = context.get_datetime()
+            today_session = self.trading_calendar.minute_to_session_label(
+                context.get_datetime()
+            )
 
-            if now == first_asset_end_date:
+            if today_session == first_asset_end_date:
                 # Equity 0 will no longer exist tomorrow, so this order will
                 # never be filled.
                 assert len(context.get_open_orders()) == 0
                 context.order(context.sid(0), 10)
                 assert len(context.get_open_orders()) == 1
-            elif now == first_asset_auto_close_date:
+            elif today_session == first_asset_auto_close_date:
                 assert len(context.get_open_orders()) == 0
 
         algo = TradingAlgorithm(
@@ -3762,12 +3828,18 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
 
         original_open_orders = orders_for_date(first_asset_end_date)
         assert len(original_open_orders) == 1
+
+        last_close_for_asset = \
+            algo.trading_calendar.open_and_close_for_session(
+                first_asset_end_date
+            )[1]
+
         self.assertDictContainsSubset(
             {
                 'amount': 10,
                 'commission': 0,
-                'created': first_asset_end_date,
-                'dt': first_asset_end_date,
+                'created': last_close_for_asset,
+                'dt': last_close_for_asset,
                 'sid': assets[0],
                 'status': ORDER_STATUS.OPEN,
                 'filled': 0,
@@ -3781,7 +3853,7 @@ class TestEquityAutoClose(WithTmpDir, WithTradingCalendar, ZiplineTestCase):
             {
                 'amount': 10,
                 'commission': 0,
-                'created': first_asset_end_date,
+                'created': last_close_for_asset,
                 'dt': first_asset_auto_close_date,
                 'sid': assets[0],
                 'status': ORDER_STATUS.CANCELLED,
