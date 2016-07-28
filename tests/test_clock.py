@@ -1,7 +1,6 @@
 from datetime import time
 from unittest import TestCase
 import pandas as pd
-import numpy as np
 from zipline.gens.sim_engine import (
     MinuteSimulationClock,
     SESSION_START,
